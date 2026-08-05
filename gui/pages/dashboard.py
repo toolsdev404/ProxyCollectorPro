@@ -6,6 +6,8 @@ from gui.components import StatCard, ProgressWidget
 from core.database import Database
 from core.events import event_bus, EventType, AppEvent
 from utils.logger import get_logger
+import time
+import threading
 
 logger = get_logger()
 
@@ -115,10 +117,16 @@ class DashboardPage(ctk.CTkFrame):
         event_bus.subscribe(EventType.STATS_UPDATE, self._on_stats_update)
         event_bus.subscribe(EventType.LOG_ENTRY, self._on_log_entry)
 
+        # DB totals update throttle
+        self._last_db_update = 0.0
+        self._db_update_interval = 5.0  # seconds
+
+        # Initial full refresh
         self.refresh()
 
     def refresh(self) -> None:
         stats = self.db.get_stats()
+        # Full refresh uses DB (manual/occasional)
         self.card_total.set_value(str(stats.get("total", 0)))
         self.card_alive.set_value(str(stats.get("alive", 0)))
         self.card_dead.set_value(str(stats.get("dead", 0)))
@@ -134,7 +142,49 @@ class DashboardPage(ctk.CTkFrame):
             self.protocol_labels[protocol].configure(text=str(count))
 
     def _on_stats_update(self, event: AppEvent) -> None:
-        self.after(0, self.refresh)
+        # Use event.data for high-frequency updates to avoid DB work on main thread
+        stats = event.data or {}
+        self.after(0, lambda: self._apply_event_stats(stats))
+
+    def _apply_event_stats(self, stats: Dict[str, Any]) -> None:
+        # Update only the high-frequency fields from engine-provided stats
+        self.card_alive.set_value(str(stats.get("alive", 0)))
+        self.card_dead.set_value(str(stats.get("dead", 0)))
+
+        by_protocol = stats.get("by_protocol", {})
+        max_count = max(by_protocol.values()) if by_protocol else 1
+        if max_count == 0:
+            max_count = 1
+
+        for protocol in ["http", "https", "socks4", "socks5"]:
+            count = by_protocol.get(protocol, 0)
+            try:
+                self.protocol_bars[protocol].set(count / max_count)
+                self.protocol_labels[protocol].configure(text=str(count))
+            except Exception:
+                # Ignore transient GUI errors
+                pass
+
+        # Throttle occasional DB totals update (total proxies and source count)
+        now = time.time()
+        if now - self._last_db_update >= self._db_update_interval:
+            self._last_db_update = now
+            threading.Thread(target=self._fetch_db_totals_thread, daemon=True).start()
+
+    def _fetch_db_totals_thread(self) -> None:
+        try:
+            stats = self.db.get_stats()
+            # Apply totals on main thread
+            self.after(0, lambda: self._apply_db_totals(stats))
+        except Exception as e:
+            logger.debug(f"Failed to fetch DB totals: {e}", "dashboard")
+
+    def _apply_db_totals(self, stats: Dict[str, Any]) -> None:
+        try:
+            self.card_total.set_value(str(stats.get("total", 0)))
+            self.card_sources.set_value(str(stats.get("sources", 0)))
+        except Exception:
+            pass
 
     def _on_log_entry(self, event: AppEvent) -> None:
         entry = event.data
@@ -147,4 +197,12 @@ class DashboardPage(ctk.CTkFrame):
             "1.0",
             f"[{ts}] [{entry.level}] {entry.message[:80]}\n"
         )
+        # Keep recent activity bounded
+        try:
+            last_index = self.activity_text.index('end-1c')
+            last_line = int(last_index.split('.')[0])
+            if last_line > 5000:
+                self.activity_text.delete('1000.0', 'end')
+        except Exception:
+            pass
         self.activity_text.configure(state="disabled")
