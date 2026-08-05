@@ -1,0 +1,451 @@
+================================================================================
+  PROXY COLLECTOR PRO — SOLUTIONS FOR VERIFIED OPEN ISSUES
+================================================================================
+Companion to: Verification_Report.txt
+Scope: Concrete fixes ONLY for items marked CONFIRMED, PARTIAL,
+       MISCHARACTERIZED, or NEW in the verification pass. Items already
+       marked FIXED are not repeated here.
+
+Ordered by the risk ranking from the verification report (§15).
+
+================================================================================
+  1. [C-03] HTTPS proxy validation scheme bug  — engine/validator.py
+================================================================================
+PROBLEM
+  `proxies = {protocol: proxy_url}` sends `https://host:port` as the proxy
+  URL for HTTPS-protocol proxies, which `requests` treats as "TLS-to-proxy"
+  instead of a standard CONNECT tunnel.
+
+FIX
+  Map both HTTP and HTTPS validation to an `http://` proxy URL, since the
+  overwhelming majority of public "HTTPS" proxies are just HTTP proxies that
+  also support CONNECT for HTTPS targets. Only use a `https://` proxy string
+  if you specifically support proxies that terminate TLS themselves (rare;
+  make it an explicit opt-in setting, not the default).
+
+  In `_validate_http`, change the proxies dict construction:
+
+      def validate(self, proxy, protocol, endpoint=None):
+          ...
+          proxy_url = f"http://{proxy.host}:{proxy.port}"   # always http://
+          ...
+          if protocol in ("http", "https"):
+              success, latency, error = self._validate_http(proxy_url, protocol, endpoint)
+
+      def _validate_http(self, proxy_url, protocol, endpoint):
+          ...
+          proxies = {"http": proxy_url, "https": proxy_url}   # both point at the same CONNECT proxy
+          resp = session.get(endpoint, proxies=proxies, ...)
+
+  This mirrors exactly how `_validate_socks4`/`_validate_socks5` already
+  build their `proxies` dict (`{"http": proxy_url, "https": proxy_url}`) —
+  bring HTTP/HTTPS validation in line with that pattern for consistency.
+
+================================================================================
+  2. [C-04 / C-06 edge case] UPSERT ID ambiguity  — core/database.py
+================================================================================
+PROBLEM
+  `cursor.lastrowid` after `INSERT ... ON CONFLICT DO UPDATE` is unreliable;
+  the fallback SELECT can race with the writer thread.
+
+FIX (requires SQLite 3.35+, bundled with Python 3.12 — safe to assume here)
+  Use `RETURNING id` so the ID always comes back atomically from the same
+  statement, regardless of whether it was an INSERT or an UPDATE:
+
+      cursor = conn.execute("""
+          INSERT INTO proxies
+          (host, port, protocol, status, anonymity, country, city, isp, asn, organization,
+           latency, score, reliability, success_count, fail_count, first_seen, last_seen,
+           last_checked, source, source_url, is_custom, fingerprint)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ON CONFLICT(host, port, protocol) DO UPDATE SET
+              last_seen = excluded.last_seen,
+              status = CASE WHEN proxies.status = 'dead' THEN 'unchecked' ELSE proxies.status END,
+              source = COALESCE(NULLIF(excluded.source, ''), proxies.source),
+              source_url = COALESCE(NULLIF(excluded.source_url, ''), proxies.source_url)
+          RETURNING id
+      """, proxy.to_db_tuple())
+      conn.commit()
+      row = cursor.fetchone()
+      if row:
+          proxy.id = row[0]
+          return row[0]
+      return None
+
+  Apply the same `RETURNING id` change to `insert_proxy()`'s inner `_insert`
+  closure for consistency (it currently has the identical `lastrowid` issue,
+  just async).
+
+  This also directly closes the C-06 edge case: `insert_proxy_sync()` will
+  now reliably return a real ID or `None`, and — combined with the fix
+  below — the caller can safely skip queuing a job when it gets `None`.
+
+FIX for the C-06 edge case itself — gui/pages/collect.py
+  Only queue a job if the insert actually produced an ID:
+
+      for proxy in proxies:
+          proxy_id = self.db.insert_proxy_sync(proxy)
+          if not proxy_id:
+              logger.warning(f"Skipping {proxy.host}:{proxy.port} — insert failed", "collect")
+              continue
+          proxy.id = proxy_id
+          job = ValidationJob(proxy=proxy, protocol=proxy.protocol, endpoint="", retries=0)
+          jobs.append(job)
+
+================================================================================
+  3. [H-07] Reader connection leak  — core/database.py
+================================================================================
+PROBLEM
+  `Database.close()` only closes the connection in `threading.local()` for
+  the calling thread. Connections opened in ThreadPoolExecutor workers are
+  never tracked or closed.
+
+FIX
+  Maintain a thread-safe registry of every connection handed out, and close
+  them all on shutdown:
+
+      class Database:
+          def __init__(self, db_path: str = DB_FILE):
+              self.db_path = db_path
+              self._local = threading.local()
+              self._all_connections: List[sqlite3.Connection] = []
+              self._conn_registry_lock = threading.Lock()
+              self._writer = DatabaseWriter(db_path)
+              self._writer.start()
+              self._init_schema()
+
+          def _get_connection(self) -> sqlite3.Connection:
+              if not hasattr(self._local, "connection") or self._local.connection is None:
+                  conn = sqlite3.connect(self.db_path, check_same_thread=False)
+                  conn.row_factory = sqlite3.Row
+                  self._local.connection = conn
+                  with self._conn_registry_lock:
+                      self._all_connections.append(conn)
+              return self._local.connection
+
+          def close(self) -> None:
+              self._writer.stop()
+              with self._conn_registry_lock:
+                  for conn in self._all_connections:
+                      try:
+                          conn.close()
+                      except Exception:
+                          pass
+                  self._all_connections.clear()
+              if hasattr(self._local, "connection"):
+                  self._local.connection = None
+
+  Also add `PRAGMA foreign_keys = ON` inside `_init_connection()` (writer)
+  and `_get_connection()` (readers) to close the FK-enforcement gap noted
+  in the audit's SQLite deep dive.
+
+================================================================================
+  4. [H-06] No SIGINT/atexit handling  — gui/app.py, main.py
+================================================================================
+FIX — main.py
+      import atexit
+      import signal
+
+      def main():
+          app = ProxyCollectorApp()
+          app.protocol("WM_DELETE_WINDOW", app.on_closing)
+
+          def _graceful_shutdown(*_):
+              app.on_closing()
+
+          signal.signal(signal.SIGINT, _graceful_shutdown)
+          atexit.register(lambda: app.db.close() if app.db else None)
+
+          app.mainloop()
+
+  Note: `signal.signal()` only reliably interrupts a blocking call on the
+  main thread; Tkinter's `mainloop()` can swallow SIGINT until the next
+  event tick. Pair this with a short `after()` poll (e.g. every 200ms, a
+  no-op `self.after(200, self._noop)`) so the interpreter gets a chance to
+  process the signal promptly — a well-known Tkinter+SIGINT interaction.
+
+================================================================================
+  5. [M-13] Swallowed DB batch errors  — core/database.py
+================================================================================
+FIX
+  Surface batch failures instead of only printing them:
+
+      def _execute_batch(self, batch: List[Tuple]) -> None:
+          try:
+              with self._connection:
+                  for operation, args in batch:
+                      operation(self._connection, *args)
+          except Exception as e:
+              from utils.logger import get_logger
+              get_logger().error(f"DB batch error ({len(batch)} ops): {e}", "database")
+              from core.events import event_bus, EventType, AppEvent
+              from datetime import datetime
+              event_bus.publish(AppEvent(
+                  event_type=EventType.ERROR,
+                  data={"source": "database_writer", "error": str(e)},
+                  timestamp=datetime.now().isoformat()
+              ))
+
+  This makes failures visible in both the log viewer and the UI (via the
+  existing EventBus ERROR event type), instead of only stdout.
+
+================================================================================
+  6. [M-14] pause() doesn't pause in-flight workers  — engine/collector.py
+================================================================================
+PROBLEM
+  `pause()` only stops new job submission; the ThreadPoolExecutor keeps
+  running already-submitted futures to completion.
+
+FIX (two options, pick based on desired UX)
+  Option A — Honest UI, no engine change:
+      Change the "Paused" status text/label to something like
+      "Pausing — N validations still in flight" until `futures` reaches
+      zero, so the UI doesn't lie about instantaneous pause.
+
+  Option B — True pause via job re-queueing:
+      Don't submit new futures while paused (already true), AND when
+      `_paused` becomes True, drain any jobs already popped from the
+      scheduler but not yet submitted back into the scheduler's queue via
+      `scheduler.add_job(job)`, so no work is lost or silently dropped.
+      In-flight `ThreadPoolExecutor` futures genuinely cannot be paused
+      mid-request (they're blocked inside `requests.get()`), so full pause
+      requires either (a) accepting Option A's UX, or (b) switching to
+      cooperative validation with periodic cancellation checks and shorter
+      per-request timeouts, which is a bigger architectural change — flag
+      for Phase 3 roadmap discussion rather than a quick patch.
+
+================================================================================
+  7. [M-06] log_level setting never applied  — utils/logger.py, main.py/app.py
+================================================================================
+FIX
+  Apply the setting once at startup and whenever it changes:
+
+  In gui/app.py `__init__`, after `self.settings = Settings.load()`:
+      logger.set_level(self.settings.log_level)
+
+  In gui/pages/settings.py, wherever the save handler currently does
+  `self.settings.log_level = self.log_level_combo.get()`, also call:
+      from utils.logger import get_logger
+      get_logger().set_level(self.settings.log_level)
+
+  Also fix `set_level()` itself — it currently only changes
+  `self.logger.setLevel(...)` (the logger's own gate), but the console and
+  file HANDLERS are hardcoded to `logging.DEBUG` and will still emit
+  everything the logger lets through them at the handler level regardless.
+  For `set_level()` to actually reduce verbosity, also update the handler
+  levels:
+
+      def set_level(self, level: str) -> None:
+          level_map = {"DEBUG": logging.DEBUG, "INFO": logging.INFO,
+                       "SUCCESS": 25, "WARNING": logging.WARNING,
+                       "ERROR": logging.ERROR}
+          lvl = level_map.get(level, logging.INFO)
+          self.logger.setLevel(lvl)
+          for handler in self.logger.handlers:
+              if not isinstance(handler, DatabaseLogHandler):
+                  handler.setLevel(lvl)
+
+================================================================================
+  8. [M-11] Built-in sources never re-synced  — sources/manager.py
+================================================================================
+FIX
+  Version-stamp the built-in source list and merge new entries on startup
+  without touching user customizations or disabling user changes to
+  existing ones:
+
+  In sources/built_in.py, add a module-level constant:
+      BUILT_IN_SOURCES_VERSION = 2   # bump on every built-in list change
+
+  In sources/manager.py `_load_sources()`:
+      def _load_sources(self) -> None:
+          db_sources = self.db.get_all_sources()
+          existing_names = {s.name for s in db_sources}
+
+          if not db_sources:
+              for src_data in BUILT_IN_SOURCES:
+                  self.db.insert_source(Source.from_dict(src_data))
+          else:
+              # Merge: add any built-in source not already present by name.
+              # Never overwrite a source the user already has (custom or
+              # previously-synced built-in) — additive merge only.
+              for src_data in BUILT_IN_SOURCES:
+                  if src_data["name"] not in existing_names:
+                      self.db.insert_source(Source.from_dict(src_data))
+
+          self._sources = self.db.get_all_sources()
+
+  Store `BUILT_IN_SOURCES_VERSION` in a small app-metadata table (or reuse
+  Settings) so this merge only needs to run once per version bump rather
+  than diffing on every launch.
+
+================================================================================
+  9. [M-04] Sequential source fetching  — sources/manager.py
+================================================================================
+FIX
+      from concurrent.futures import ThreadPoolExecutor, as_completed
+
+      def fetch_all(self) -> List[Proxy]:
+          all_proxies = []
+          enabled = self.get_enabled_sources()
+          logger.info(f"Fetching from {len(enabled)} enabled sources", "sources")
+
+          def _fetch_one(source: Source):
+              try:
+                  headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+                  resp = requests.get(source.url, headers=headers, timeout=20)
+                  if resp.status_code == 200:
+                      if source.parse_pattern == "plain" or source.url.endswith(".txt"):
+                          parsed = parse_proxy_list(resp.text, source.name, source.url)
+                      else:
+                          parsed = parse_html_for_proxies(resp.text, source.name, source.url)
+                      source.total_proxies = len(parsed)
+                      source.success_count += 1
+                      source.last_check = datetime.now().isoformat()
+                      logger.success(f"Source '{source.name}': {len(parsed)} proxies", "sources")
+                      return source, parsed
+                  else:
+                      source.fail_count += 1
+                      logger.warning(f"Source '{source.name}': HTTP {resp.status_code}", "sources")
+                      return source, []
+              except Exception as e:
+                  source.fail_count += 1
+                  logger.error(f"Source '{source.name}': {str(e)[:80]}", "sources")
+                  return source, []
+
+          with ThreadPoolExecutor(max_workers=5, thread_name_prefix="SourceFetch") as pool:
+              futures = [pool.submit(_fetch_one, s) for s in enabled]
+              for future in as_completed(futures):
+                  source, parsed = future.result()
+                  for p in parsed:
+                      all_proxies.append(Proxy(
+                          host=p["host"], port=p["port"],
+                          protocol=p.get("protocol", source.protocol or "http"),
+                          source=p.get("source", source.name),
+                          source_url=p.get("source_url", source.url),
+                          status="unchecked"
+                      ))
+                  self.update_source(source)
+
+          # dedup unchanged from existing code
+          ...
+
+  `max_workers=5` matches the roadmap's own recommendation and avoids
+  hammering all 16 built-in sources' hosts simultaneously.
+
+================================================================================
+  10. Remaining lower-urgency items — quick fixes
+================================================================================
+
+M-02  validator.close() never called
+      Call it in engine/collector.py's `run()`, in a `finally` block around
+      the main loop:
+          finally:
+              self.validator.close()
+
+M-03  Unbounded GeoIP cache
+      Swap the plain dict for a bounded cache:
+          from functools import lru_cache
+      ...or, since resolve() takes a plain string key and you want TTL, use
+      `cachetools.TTLCache(maxsize=5000, ttl=3600)` as a drop-in replacement
+      for `self._cache`, if the `cachetools` dependency is acceptable
+      (add to requirements.txt). Otherwise implement a simple manual cap:
+          if len(self._cache) > 5000:
+              self._cache.pop(next(iter(self._cache)))  # crude FIFO eviction
+
+M-05  Auth (user:pass@host:port) silently dropped
+      In utils/helpers.py `parse_proxy_string()`, thread the captured
+      groups through:
+          return {
+              "host": host, "port": port, "protocol": protocol.lower(),
+              "username": match.group("user") if match and "user" in match.groupdict() else None,
+              "password": match.group("pass") if match and "pass" in match.groupdict() else None,
+          }
+      Then extend core/models.Proxy with optional username/password fields,
+      and build the proxy URL as
+      `f"{protocol}://{user}:{pw}@{host}:{port}"` in validator.py when
+      credentials are present.
+
+M-09  Unbounded event queue
+      In core/events.py `publish_async()`, cap the queue and drop oldest:
+          def publish_async(self, event: AppEvent) -> None:
+              if self._queue.qsize() > 10000:
+                  try:
+                      self._queue.get_nowait()  # drop oldest
+                  except queue.Empty:
+                      pass
+              self._queue.put(event)
+
+L-02  Export filename collisions
+      Add milliseconds or a short random suffix:
+          timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+
+Reset sqlite_sequence on clear_proxies() (§16.3 in verification report)
+      def _clear(conn):
+          conn.execute("DELETE FROM proxies")
+          conn.execute("DELETE FROM protocol_capabilities")
+          conn.execute("DELETE FROM history")
+          conn.execute("DELETE FROM sqlite_sequence WHERE name IN ('proxies','protocol_capabilities','history')")
+          conn.commit()
+
+================================================================================
+  11. New findings from verification (N-01, N-02, N-03)
+================================================================================
+
+N-01  Duplicate Database instance from DatabaseLogHandler
+      utils/logger.py — pass the app's single Database instance into the
+      logger instead of letting DatabaseLogHandler construct its own:
+          # in gui/app.py, after self.db = Database():
+          get_logger().attach_database(self.db)
+
+          # in utils/logger.py:
+          class DatabaseLogHandler(logging.Handler):
+              def __init__(self):
+                  super().__init__()
+                  self._db = None
+              def attach_database(self, db):
+                  self._db = db
+              def emit(self, record):
+                  if self._db is None:
+                      return   # drop DB-bound logs until attached; console/file still capture them
+                  ...
+      Add a matching `AppLogger.attach_database(db)` that forwards to the
+      handler. This removes the second DatabaseWriter thread/connection
+      entirely.
+
+N-02  Unclosed socket in anonymity.py _check_socks() on connect failure
+      Use try/finally instead of relying on the happy-path close():
+          s = socks.socksocket()
+          try:
+              s.set_proxy(socks.SOCKS5 if "socks5" in proxy_url else socks.SOCKS4, host, port)
+              s.settimeout(timeout)
+              s.connect(("httpbin.org", 80))
+              return "anonymous", evidence
+          except Exception as e:
+              return "unclassified", {"error": str(e)}
+          finally:
+              try:
+                  s.close()
+              except Exception:
+                  pass
+      (This also lets you delete the dead `old_socket` save/restore code,
+      which never did anything useful since `socks.socksocket()` doesn't
+      touch the global `socket.socket`.)
+
+N-03  Thousands of sequential synchronous inserts before collection starts
+      In gui/pages/collect.py, switch to a two-phase approach: batch-insert
+      all discovered proxies first (`db.insert_proxies_batch()`, already
+      exists and is async/batched), then do a single bulk lookup by
+      (host, port, protocol) to populate IDs before building jobs, rather
+      than one synchronous round-trip per proxy:
+          self.db.insert_proxies_batch(proxies)
+          self.db.checkpoint()  # optional, forces the batch to flush before continuing
+          # then look up IDs in one query, e.g. a new
+          # db.get_proxies_by_endpoints([(host,port,protocol), ...]) helper
+      This requires the writer queue to be flushed synchronously before the
+      lookup, which is not currently exposed — add a `Database.flush_and_wait()`
+      that sets the writer's flush event and blocks until `_pending_count`
+      returns to 0, for this specific bulk-import use case.
+
+================================================================================
+  END OF SOLUTIONS REPORT
+================================================================================

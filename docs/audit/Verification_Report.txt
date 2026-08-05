@@ -1,0 +1,555 @@
+================================================================================
+  PROXY COLLECTOR PRO — AUDIT VERIFICATION REPORT
+================================================================================
+Verified against : proxy_collector_pro_fixed.zip (as uploaded)
+Verified date     : 2026-08-05
+Method            : Direct source inspection of every file referenced in the
+                     original audit report, cross-checked line by line.
+
+IMPORTANT CONTEXT: The uploaded archive is named "..._fixed.zip" and its code
+does NOT match the codebase described in the audit in several modules
+(engine/scheduler.py, engine/validator.py, engine/anonymity.py,
+engine/endpoints.py, sources/manager.py, utils/logger.py have all been
+substantially rewritten). This means the original audit was performed against
+an EARLIER version of the app. Some findings are now fixed, some remain
+verbatim, and a few are only PARTIALLY fixed or have re-appeared in a
+different form. Each item below is individually verified.
+
+Legend:
+  [CONFIRMED]     – Bug reproduced exactly as described, still in code today.
+  [FIXED]         – Code has changed; the described defect no longer exists.
+  [PARTIAL]       – Rewritten, but a related/weaker version of the issue remains.
+  [MISCHARACTERIZED] – Present in some form, but audit's description of the
+                     mechanism or impact doesn't match the current code.
+  [NEW]           – Issue found during verification that was not in the audit.
+
+================================================================================
+  1. CRITICAL BUGS (P0)
+================================================================================
+
+C-01  utils/diagnostics.py — missing datetime import / _add_result crash
+      [FIXED] — The file has been rewritten entirely. There is no `_add_result`
+      method and no bare `datetime.now()` call anywhere in the file. Diagnostics
+      no longer touches datetime at all. Confirmed via full file read.
+
+C-02  engine/scheduler.py — counts incremented on dispatch, not success
+      [FIXED] — Confirmed via full file read. `get_job()` (dispatch) does NOT
+      touch `_current_counts`. Only `mark_success(protocol)` increments it,
+      and `_process_batch()` in collector.py only calls `mark_success()` on
+      the success branch. `all_targets_reached()` now correctly reflects
+      validated successes, not dispatch attempts.
+
+C-03  engine/validator.py — HTTPS proxy scheme bug (proxies={'https': 'https://..'})
+      [CONFIRMED] — Still present, byte-for-byte the same defect:
+          proxy_url = f"{protocol}://{proxy.host}:{proxy.port}"
+          ...
+          proxies = {protocol: proxy_url}
+      When protocol == "https", this produces
+      `proxies={"https": "https://host:port"}`, which `requests` interprets as
+      "negotiate TLS with the proxy itself" rather than a standard CONNECT
+      tunnel. Most public "HTTPS" proxies are CONNECT-only and will fail
+      validation. This is the single most consequential unfixed bug in the
+      codebase — it silently kills most HTTPS proxy validation.
+
+C-04  core/database.py — insert_proxy_sync() relies on lastrowid after UPSERT
+      [CONFIRMED] — Still present verbatim:
+          cursor = conn.execute("... ON CONFLICT(...) DO UPDATE ...")
+          if cursor.lastrowid:
+              proxy.id = cursor.lastrowid
+              return cursor.lastrowid
+          else:
+              existing = self.get_proxy_by_endpoint(...)
+      `lastrowid` behavior on an UPSERT that hits the UPDATE branch is
+      version/driver-dependent in SQLite; the fallback SELECT can race with
+      the async DatabaseWriter thread and return stale or None data.
+
+C-05  engine/anonymity.py — leaked_ip always True (httpbin.org/ip design flaw)
+      [FIXED] — The anonymity checker has been completely rewritten. It no
+      longer uses httpbin.org/ip or a body-IP regex. It now hits
+      httpbin.org/get and inspects response HEADERS for Via/X-Forwarded-For/
+      etc., and checks whether `origin` contains a comma (multiple IPs) to
+      detect real-IP leakage. This is a legitimate, working approach — ELITE
+      classification is achievable again. (See §17 "New Findings" for a minor
+      leftover code-smell in this same function.)
+
+C-06  engine/collector.py — proxy.id is None crash on protocol_capability calls
+      [FIXED, with one edge case] — gui/pages/collect.py now calls
+      `insert_proxy_sync()` (synchronous, returns ID immediately) before
+      building each ValidationJob, so proxy.id is populated before entering
+      the pipeline that calls `set_protocol_capability(proxy.id, ...)`.
+      EDGE CASE STILL OPEN: in collect.py, `proxy.id = proxy_id` is only
+      assigned `if proxy_id:` — but the job is appended to the queue
+      unconditionally afterward. If `insert_proxy_sync()` returns None (its
+      exception path, or a failed fallback SELECT — see C-04), the proxy is
+      still queued with `id = None`, and the original crash can still occur
+      downstream in `_process_batch()`. Rare, but not impossible, and it is
+      directly caused by C-04's own failure mode.
+
+================================================================================
+  2. HIGH PRIORITY BUGS (P1)
+================================================================================
+
+H-01  engine/endpoints.py — no threading lock, races on shared state
+      [FIXED] — Rewritten. `EndpointPool` now guards every mutation
+      (`get_endpoint`, `report_result`, `add_endpoint`, `remove_endpoint`)
+      inside `with self._lock:`. Confirmed no unguarded writes to `_health`
+      or `_endpoints`.
+      [NEW, minor] — `EndpointManager.get_pool()` (the singleton that hands
+      out `EndpointPool` instances) reads/writes `self._pools` with no lock,
+      even though `EndpointManager.__new__` itself is lock-protected. Two
+      validator threads calling `get_pool("http")` for the first time
+      concurrently could both pass the `if protocol not in self._pools`
+      check and construct two separate `EndpointPool` objects, silently
+      discarding one. Low severity (self-heals after first call) but real.
+
+H-02  engine/validator.py — SOCKS socket never closed on exception path
+      [FIXED / NO LONGER APPLICABLE] — The validator no longer opens raw
+      `socks.socksocket()` connections at all. SOCKS4/5 validation is now
+      done via `requests.get(..., proxies={"http": "socks4://...", ...})`,
+      i.e. through PySocks' `requests` integration, which manages its own
+      connection lifecycle. There is no longer a manual socket to leak here.
+      NOTE: a similar-shaped socket IS still opened manually in
+      engine/anonymity.py's `_check_socks()` — see §17 New Findings.
+
+H-03  engine/scheduler.py — `_dedup` set never pruned, survives clear()
+      [FIXED] — The set is now named `_seen`, and `reset()` explicitly calls
+      `self._seen.clear()` alongside clearing the queues and counts. It is
+      also called from gui/pages/collect.py at the start of every collection
+      run (`self.scheduler.reset()`), so stale dedup state across runs is no
+      longer an issue in the normal flow.
+
+H-04  engine/geoip.py — ip-api.com with no rate limiting, 45 req/min free tier
+      [PARTIAL] — The provider changed from ip-api.com to ipapi.co, so the
+      specific ToS/rate-limit numbers cited no longer apply verbatim. However,
+      the underlying defect is unchanged: there is still ZERO client-side
+      rate limiting in `GeoIPResolver`. ipapi.co's free tier is roughly
+      1,000 requests/day (~30k/month); with 200 concurrent validator threads
+      and GeoIP enabled, that budget is exhausted in seconds, and the code
+      has no backoff/throttle to prevent it. Functionally the same bug,
+      different vendor.
+
+H-05  utils/helpers.py — calculate_score() called with freshness=0 hardcoded
+      [MISCHARACTERIZED, still a real bug] — Confirmed the call site in
+      engine/collector.py still hardcodes the freshness argument:
+          proxy.score = calculate_score(
+              proxy.latency, proxy.success_rate / 100,
+              0,  # freshness handled by DB
+              ...
+          )
+      BUT the audit's stated impact ("15% of the score is permanently zero")
+      is backwards for this codebase's formula:
+          fresh_score = max(0, 100 - (freshness_hours * 4.17))
+      With `freshness_hours=0`, `fresh_score` evaluates to **100** (maximum),
+      not 0. So every proxy actually receives full marks on the freshness
+      component regardless of how old it really is — inflating scores for
+      stale proxies rather than zeroing them out. The bug is real (freshness
+      is not actually measured), but the direction of the effect is opposite
+      to what the audit describes.
+
+H-06  gui/app.py — no SIGINT/atexit handlers beyond on_closing
+      [CONFIRMED] — `on_closing()` exists and is wired to `WM_DELETE_WINDOW`
+      (closes the DB, destroys the window), but there is still no
+      `signal.signal(signal.SIGINT, ...)` and no `atexit.register(...)`
+      anywhere in gui/app.py or main.py. A Ctrl+C in a console-attached run,
+      or a force-kill, bypasses `on_closing()` entirely and can leave the
+      DatabaseWriter thread and WAL files in an unclean state exactly as
+      described.
+
+H-07  core/database.py — Database.close() only closes calling thread's connection
+      [CONFIRMED] — Verbatim:
+          def close(self) -> None:
+              self._writer.stop()
+              if hasattr(self._local, "connection") and self._local.connection:
+                  self._local.connection.close()
+      `self._local` is `threading.local()`; reader connections created inside
+      ThreadPoolExecutor worker threads are invisible to the thread that
+      calls `close()` and are never closed. No connection registry exists.
+
+H-08  sources/manager.py — test_source() inserts into production DB
+      [FIXED] — `test_source()` now only calls `requests.get()`, parses the
+      response with `parse_proxy_list`/`parse_html_for_proxies`, and updates
+      the Source's own health-score bookkeeping. It no longer calls
+      `db.insert_proxy()` for discovered proxies. Testing a source is now
+      non-destructive/idempotent.
+
+H-09  engine/collector.py — _wait_for_futures() breaks immediately, ignores max_wait
+      [FIXED / REWRITTEN] — The method has been rewritten:
+          while remaining and (time.time() - start) < max_wait:
+              just_done, remaining = concurrent.futures.wait(remaining, timeout=timeout, ...)
+              done.update(just_done)
+              if len(done) >= len(futures) // 2:
+                  break
+      `max_wait` is now genuinely respected as the outer loop's time budget,
+      and `done` accumulates across iterations rather than resetting, so the
+      exact defect described (always-true condition on the first iteration)
+      no longer reproduces. The "break at 50% done" early-exit is a
+      deliberate (if debatable) design choice now, not a broken loop
+      invariant — flagged as a design note, not a bug, in §16.
+
+================================================================================
+  3. MEDIUM BUGS (P2)
+================================================================================
+
+M-01  Hardcoded httpbin.org:80 for SOCKS validation, no rotation
+      [PARTIAL] — SOCKS4/5 validation now primarily uses the endpoint from
+      `EndpointManager` (which does rotate/fail over), but still falls back
+      to a hardcoded `"http://httpbin.org/ip"` whenever the selected
+      endpoint happens to be HTTPS. That fallback has no rotation/failover
+      of its own — a narrower version of the original issue.
+
+M-02  ProxyValidator.close() never invoked
+      [CONFIRMED] — `close()` exists on `ProxyValidator` (closes pooled
+      `requests.Session` objects) but grep across the codebase shows it is
+      never called from `CollectionEngine` or `ProxyCollectorApp`. Sessions
+      accumulate in `_session_pool` for the lifetime of the validator
+      instance with no cleanup path.
+
+M-03  engine/geoip.py — _cache dict unbounded, no TTL/LRU
+      [CONFIRMED] — `self._cache: Dict[str, Dict[str, Any]] = {}` with no
+      eviction logic anywhere; only a manual `clear_cache()` exists, which is
+      never called automatically.
+
+M-04  sources/manager.py — fetch_all() iterates sources sequentially
+      [CONFIRMED] — `for source in enabled: resp = requests.get(...)` — a
+      plain blocking loop, no ThreadPoolExecutor or async fetch.
+
+M-05  sources/manager.py / utils/helpers.py — no auth (user:pass@host:port) parsing
+      [PARTIAL] — `PROXY_PATTERN` in helpers.py actually DOES contain named
+      capture groups for user/pass:
+          r"(?:(?P<user>[^:@]+):(?P<pass>[^:@]+)@)?"
+      However, `parse_proxy_string()` never reads `match.group("user")` or
+      `match.group("pass")` — it only extracts host/port/protocol and
+      discards the credentials. So the regex can match authenticated proxy
+      strings without erroring, but the parsed result silently drops the
+      credentials rather than failing outright. Net effect is the same as
+      the audit describes (auth proxies aren't usable), but the mechanism is
+      "silently dropped" rather than "unsupported/fails to match."
+
+M-06  utils/logger.py — settings.log_level loaded but never applied
+      [CONFIRMED] — `AppLogger.set_level()` exists and correctly maps level
+      names, but grep across the entire codebase shows it is never called.
+      `gui/pages/settings.py` reads/writes `settings.log_level` to/from the
+      UI and persists it, but nothing wires that value back into the logger.
+      Console and file handlers are hardcoded to `logging.DEBUG`.
+
+M-07  utils/logger.py — success() logs at INFO, LogLevel.SUCCESS unused
+      [FIXED] — `success()` now calls `self.logger.log(25, msg, ...)` where
+      25 is a registered custom level (`logging.addLevelName(25, "SUCCESS")`),
+      and `ColoredFormatter` has a dedicated color for `"SUCCESS"`. This is
+      correctly implemented now.
+
+M-08  gui/app.py — pages instantiated once, retained forever
+      [CONFIRMED] — `self.pages[name] = page` caches every page permanently
+      the first time it's shown; there is no destroy/release path. Confirmed
+      in `_show_page()`.
+
+M-09  core/events.py — publish_async() queue has no backpressure
+      [CONFIRMED] — `publish_async()` does a plain `self._queue.put(event)`
+      with no size cap; `process_queue()` must be polled externally and
+      nothing bounds queue growth if polling stalls.
+
+M-10  engine/endpoints.py — healthy.sort() mutates original list (aliasing)
+      [FIXED / NO LONGER APPLICABLE] — There is no `.sort()` call anywhere in
+      the rewritten `EndpointPool`. Endpoint selection now uses a simple
+      round-robin index (`self._rr_index`) over a filtered `healthy` list,
+      which is a new list each call, not sorted in place.
+
+M-11  sources/manager.py — built-in sources never re-synced after DB init
+      [CONFIRMED] — `_load_sources()` only seeds built-ins `if not db_sources`
+      (i.e., only on a completely empty sources table). There is no
+      version-stamp or migration logic to merge new built-ins into an
+      existing install. A manual `reset_to_builtin()` exists but is not
+      automatic and is destructive (deletes custom sources too).
+
+M-12  utils/exporter.py — grouping ignored for CSV/JSON
+      [FIXED] — `ExportEngine.export()` now branches on
+      `config.grouping` (GROUPED / SEPARATE / BOTH) BEFORE format handling,
+      and `_export_grouped()` / `_export_separate()` both implement all
+      three formats (TXT, CSV, JSON) consistently. Grouping is honored for
+      every format now.
+      [STILL OPEN, narrower than before] — Scheme handling
+      (`ExportScheme.WITHOUT_SCHEME`) is still TXT-only. CSV/JSON always emit
+      separate host/port columns or dict fields regardless of `config.scheme`
+      — this part of the original finding (§13.2 in the audit) still holds,
+      even though grouping itself is fixed.
+
+M-13  core/database.py — DatabaseWriter swallows batch exceptions
+      [CONFIRMED] — `_execute_batch()`:
+          except Exception as e:
+              print(f"DB batch error: {e}")
+      Errors go to stdout only; nothing surfaces to the caller, the event
+      bus, or the app's log system. Callers of `enqueue()` have no way to
+      know a write failed.
+
+M-14  engine/collector.py — pause() doesn't pause running workers
+      [CONFIRMED] — `pause()` sets `_paused = True`, which only stops
+      `get_job()` from the scheduler and new job submission in the main
+      loop. Futures already submitted to the `ThreadPoolExecutor` continue
+      running to completion; there is no mechanism to suspend in-flight
+      validations.
+
+================================================================================
+  4. LOW BUGS (P3)
+================================================================================
+
+L-01  Malformed User-Agent string
+      [FIXED] — All User-Agent strings observed (validator.py, anonymity.py,
+      manager.py, diagnostics.py) now read:
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" — this is
+      a standard, well-formed UA string.
+
+L-02  Export filename second-resolution collision
+      [CONFIRMED] — `timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")` —
+      still second-resolution. Two exports within the same second still
+      overwrite each other's files.
+
+L-03  No sidebar active-state styling
+      [FIXED] — `_show_page()` now explicitly resets all buttons to
+      `fg_color="transparent"` and highlights the active one with
+      `fg_color=("gray80", "#16213e")`.
+
+L-04  Thin test suite
+      [CONFIRMED, still thin] — tests/ now totals 153 lines across
+      test_database.py (60), test_export.py (48), test_scheduler.py (45),
+      plus an empty __init__.py. No concurrency tests, no scheduler-target
+      tests, no validator protocol-matrix tests were found.
+
+L-05  build_exe.bat uses --onefile --windowed
+      Not independently verified (build script not reviewed in this pass —
+      out of scope of the Python source audit); no reason to believe it has
+      changed given the rest of the packaging code was untouched.
+
+================================================================================
+  5. RACE CONDITIONS & THREAD SAFETY (Section 7 of audit)
+================================================================================
+
+7.1 EndpointManager zero synchronization
+    [FIXED for EndpointPool] — see H-01. [NEW minor race remains in
+    EndpointManager.get_pool(), see H-01 note above.]
+
+7.2 DatabaseWriter pending-count read-outside-lock
+    [CONFIRMED] — `enqueue()` still increments `_pending_count` under the
+    lock, then reads it in a separate `if self._pending_count >=
+    self.batch_size:` check outside the lock. The race as described is
+    unchanged.
+
+7.3 EventBus callbacks run outside the lock
+    [CONFIRMED] — `publish()` copies the subscriber list under `self._lock`,
+    then calls each callback after releasing the lock, exactly as described.
+    By design this is usually fine (avoids holding a lock during arbitrary
+    callback code) but a callback that mutates shared state still has no
+    synchronization guarantee from EventBus itself.
+
+7.4 SourceManager shallow copy exposes mutable Source objects
+    [CONFIRMED] — `get_all_sources()` / `get_sources()` return
+    `self._sources.copy()`, a shallow copy. The `Source` objects inside are
+    the same mutable instances held internally; a caller can still mutate
+    `source.enabled` etc. without going through `update_source()`.
+
+================================================================================
+  6. MEMORY ISSUES (Section 8 of audit)
+================================================================================
+
+  Unbounded Dedup (_dedup/_seen)     [FIXED]     — cleared via reset()
+  Unbounded GeoIP Cache               [CONFIRMED] — still unbounded
+  Unbounded Event Queue               [CONFIRMED] — still unbounded
+  UI Page Retention                   [CONFIRMED] — still retained forever
+  DB Writer Queue (unbounded)         [CONFIRMED] — plain queue.Queue(), no maxsize
+  Connection Pool Leak (validator)    [PARTIAL]   — session pool exists but
+                                                     close() is never called (M-02)
+
+================================================================================
+  7. HTTPS VALIDATION DEEP DIVE (Section 11)
+================================================================================
+  [CONFIRMED — see C-03 above]. This remains the highest-impact unfixed bug:
+  it silently fails validation for the majority of public "HTTPS" proxies,
+  which are CONNECT-tunnel proxies expecting `http://` in the proxy URL, not
+  `https://`.
+
+================================================================================
+  8. SQLITE DEEP DIVE (Section 12)
+================================================================================
+
+  1. Connection leak on close           [CONFIRMED — see H-07]
+  2. WAL checkpointing                  [PARTIAL] — a `checkpoint()` method
+     now exists (`PRAGMA wal_checkpoint(TRUNCATE)`) but nothing calls it
+     automatically on a schedule or on close(); it must be invoked manually.
+     No `PRAGMA journal_size_limit` is set anywhere.
+  3. UPSERT ID ambiguity                [CONFIRMED — see C-04]
+  4. No foreign key enforcement         [CONFIRMED] — grep for
+     "foreign_keys" across the entire codebase returns zero matches. FK
+     constraints exist in the schema (e.g. history.proxy_id,
+     protocol_capabilities.proxy_id ON DELETE CASCADE) but are never enforced
+     because `PRAGMA foreign_keys = ON` is never issued.
+
+================================================================================
+  9. EXPORT DEEP DIVE (Section 13)
+================================================================================
+  1. Grouping ignored                   [FIXED — see M-12]
+  2. Scheme ignored for CSV/JSON        [CONFIRMED — see M-12 note]
+  3. Misleading count (splitlines vs proxy count)
+     [CONFIRMED] — `_write_file`-style line counting is no longer present in
+     this rewrite (the new `export()` sets `result["total"] = len(proxies)`
+     directly), so this specific sub-finding is actually FIXED — count now
+     correctly reflects the proxy count, not line count, for all formats.
+
+================================================================================
+  10. SOURCE MANAGER DEEP DIVE (Section 14)
+================================================================================
+  1. Test side effects           [FIXED — see H-08]
+  2. Stale built-ins              [CONFIRMED — see M-11]
+  3. No parallel fetch            [CONFIRMED — see M-04]
+  4. Missing auth parsing         [PARTIAL — see M-05]
+
+================================================================================
+  11. UI PROBLEMS (Section 15)
+================================================================================
+  No pagination                  [CONFIRMED] — grep for LIMIT/OFFSET/page in
+                                  gui/pages/proxies.py returns nothing;
+                                  get_all_proxies() has no limit/offset params.
+  No active state                [FIXED — see L-03]
+  Settings stale mid-run         Not independently re-verified this pass;
+                                  CollectionEngine still reads
+                                  `Settings.load()` once in `__init__`, so the
+                                  underlying architecture is unchanged —
+                                  treat as still CONFIRMED unless proven
+                                  otherwise.
+  Diagnostics crash               [FIXED — see C-01]
+  No progress indicators          Not independently re-verified this pass.
+
+================================================================================
+  12. PAUSE/RESUME/RESET (Section 16)
+================================================================================
+  1. Pause doesn't pause workers       [CONFIRMED — see M-14]
+  2. No explicit "New Run" workflow    [FIXED] — `scheduler.reset()` is now
+     explicitly called at the start of every collection run in
+     gui/pages/collect.py, addressing the core complaint (stale dedup/stats
+     carrying over between runs).
+  3. sqlite_sequence never reset on clear
+     [CONFIRMED] — `clear_proxies()` only does `DELETE FROM proxies` (etc.);
+     no `DELETE FROM sqlite_sequence WHERE name='proxies'`, so AUTOINCREMENT
+     IDs keep climbing indefinitely even after a full clear.
+
+================================================================================
+  13. MODULE COMPLETION ESTIMATES
+================================================================================
+  The original percentage table cannot be meaningfully re-verified line by
+  line without a formal re-audit, but given the scope of rewriting observed
+  in scheduler.py, validator.py, anonymity.py, endpoints.py, logger.py, and
+  exporter.py, several modules have measurably improved:
+    engine/scheduler.py    was 65%  -> now materially higher; core counting
+                            and dedup-persistence bugs are fixed.
+    engine/endpoints.py    was 60%  -> now materially higher; locking is in
+                            place and sort-aliasing bug is gone.
+    engine/anonymity.py    was 50%  -> now materially higher; detection logic
+                            is coherent and testable.
+    utils/exporter.py      was 65%  -> now materially higher; grouping works
+                            for all formats.
+    utils/logger.py        was 70%  -> now materially higher; rotation and
+                            SUCCESS level work; log_level wiring still missing.
+  Modules essentially unchanged from the audit's estimate:
+    core/database.py, engine/validator.py (HTTPS scheme bug persists),
+    engine/collector.py (freshness/lock/pause issues persist),
+    sources/manager.py (sequential fetch, stale built-ins persist).
+
+================================================================================
+  14. SUMMARY TABLE
+================================================================================
+
+  ID     Status              One-line verdict
+  -----  ------------------  ---------------------------------------------
+  C-01   FIXED               datetime import bug gone, file rewritten
+  C-02   FIXED               counts now on success, not dispatch
+  C-03   CONFIRMED           HTTPS proxy scheme bug — still broken
+  C-04   CONFIRMED           UPSERT/lastrowid ID ambiguity — still broken
+  C-05   FIXED               anonymity detection rewritten, works
+  C-06   FIXED (edge case)   sync insert used; None-ID path still reachable
+  H-01   FIXED (minor gap)   endpoints locked; get_pool() itself unlocked
+  H-02   FIXED               no manual socket in validator anymore
+  H-03   FIXED               dedup set cleared via reset()
+  H-04   PARTIAL             different vendor, same lack of rate limiting
+  H-05   MISCHARACTERIZED    freshness hardcoded, but inflates score, not zeroes
+  H-06   CONFIRMED           still no SIGINT/atexit handling
+  H-07   CONFIRMED           still leaks per-thread reader connections
+  H-08   FIXED               test_source() no longer writes to DB
+  H-09   FIXED               loop rewritten, max_wait now respected
+  M-01   PARTIAL             endpoint rotation exists; https fallback hardcoded
+  M-02   CONFIRMED           validator.close() still never called
+  M-03   CONFIRMED           GeoIP cache still unbounded
+  M-04   CONFIRMED           source fetch still sequential
+  M-05   PARTIAL             regex captures auth; parser discards it
+  M-06   CONFIRMED           log_level setting still not applied
+  M-07   FIXED               SUCCESS level now used correctly
+  M-08   CONFIRMED           pages still retained forever
+  M-09   CONFIRMED           event queue still unbounded
+  M-10   FIXED               no more in-place sort/aliasing
+  M-11   CONFIRMED           built-ins still never re-synced
+  M-12   FIXED (partial)     grouping fixed; scheme still TXT-only
+  M-13   CONFIRMED           batch errors still swallowed via print()
+  M-14   CONFIRMED           pause still doesn't stop in-flight workers
+  L-01   FIXED               UA string now well-formed
+  L-02   CONFIRMED           export filenames still second-resolution
+  L-03   FIXED               active nav state implemented
+  L-04   CONFIRMED           test suite still thin (153 lines)
+  L-05   NOT RE-VERIFIED     build script out of scope this pass
+
+================================================================================
+  15. RISK RANKING OF WHAT'S STILL OPEN (highest impact first)
+================================================================================
+  1. C-03  HTTPS validation scheme bug — breaks a whole protocol class.
+  2. C-04  UPSERT/lastrowid ID ambiguity — root cause of C-06's edge case too.
+  3. H-07  Reader connection leak — long-running instances degrade over time.
+  4. H-06  No SIGINT/atexit — unclean shutdown / WAL corruption risk.
+  5. M-13  Swallowed DB batch errors — failures are invisible.
+  6. M-14  Pause doesn't pause workers — misleading UI state.
+  7. M-06  log_level not applied — noisy logs, disk growth.
+  8. M-11  Stale built-in sources — silent product staleness across releases.
+  9. M-04  Sequential source fetch — pure performance, not correctness.
+  10. Everything else (M-02, M-03, M-05, M-09, L-02, L-04, foreign_keys) —
+      real but lower urgency.
+
+================================================================================
+  16. NOTES / DESIGN OBSERVATIONS (not bugs, but worth flagging)
+================================================================================
+  - The 50%-early-break in `_wait_for_futures()` is a legitimate design
+    choice post-rewrite, but it does mean shutdown/backpressure behavior is
+    approximate rather than exact — worth a comment in the code so a future
+    maintainer doesn't mistake it for a bug (which is exactly what the
+    original audit did).
+  - `scheduler.reset()` being called at the start of every run is good, but
+    it also means a user can never intentionally resume a partial run
+    without losing progress — there's no "continue" mode, only "reset and
+    restart" or "let it keep going." Worth deciding if that's intended.
+
+================================================================================
+  17. NEW FINDINGS (not in the original audit)
+================================================================================
+  N-01  utils/logger.py — DatabaseLogHandler.emit() lazily does
+        `self._db = Database()` the first time a log record is emitted. This
+        constructs an ENTIRELY SEPARATE `Database` instance (its own
+        DatabaseWriter thread, its own SQLite connection, its own schema
+        init) from the one `ProxyCollectorApp` creates in `gui/app.py`. Both
+        instances write to the same on-disk SQLite file concurrently. This
+        doubles the number of writer threads and connections hitting the
+        same WAL file for no functional benefit, and is a duplicate-writer
+        pattern the original audit's WAL/connection-leak findings didn't
+        anticipate because this handler didn't exist in the audited version.
+
+  N-02  engine/anonymity.py — `_check_socks()` opens a raw `socks.socksocket()`
+        and only calls `s.close()` after a successful `connect()`. If
+        `connect()` raises, the socket is never closed (caught by the bare
+        `except Exception` below it, which does not clean up `s`). This is
+        the same shape of leak as the audit's old H-02, just relocated from
+        validator.py into anonymity.py after the rewrite.
+
+  N-03  gui/pages/collect.py — `fetch_all()` proxies are inserted one at a
+        time via synchronous `insert_proxy_sync()` in a plain Python loop
+        before jobs are queued. For a source batch of thousands of proxies,
+        this is thousands of sequential, individually-committed SQLite
+        writes on the UI/collection thread before any validation even
+        starts — a new performance bottleneck introduced by the C-06 fix
+        (using batch insert + a follow-up ID lookup would avoid this).
+
+================================================================================
+  END OF VERIFICATION REPORT
+================================================================================
