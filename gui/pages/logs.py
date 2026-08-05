@@ -68,9 +68,16 @@ class LogsPage(ctk.CTkFrame):
         self.current_level = None
         self.refresh()
 
+        # Subscribe to new log entries and append incrementally instead of
+        # reloading the entire log content on each event to avoid blocking the
+        # Tk main thread when logs are emitted rapidly during collection.
         event_bus.subscribe(EventType.LOG_ENTRY, self._on_log_entry)
 
     def refresh(self) -> None:
+        """Reload the most recent logs into the text widget. This is intended
+        for manual refreshes or the initial load; frequent automatic updates
+        are handled incrementally by _on_log_entry to avoid heavy main-thread work.
+        """
         self.log_text.configure(state="normal")
         self.log_text.delete("1.0", "end")
 
@@ -110,5 +117,36 @@ class LogsPage(ctk.CTkFrame):
                     )
             logger.success(f"Logs exported to {path}", "gui")
 
+    def _append_log_entry(self, entry) -> None:
+        """Append a single log entry to the text widget on the main thread.
+        Filters by current_level when set.
+        """
+        level = entry.level if hasattr(entry, "level") else getattr(entry, "level", None)
+        if self.current_level and level != self.current_level:
+            return
+
+        # Insert at end and keep disabled state for read-only display
+        self.log_text.configure(state="normal")
+        ts = entry.timestamp
+        msg = entry.message
+        self.log_text.insert("end", f"[{ts}] [{level}] {msg}\n")
+
+        # Optional: keep the widget from growing indefinitely in memory/UI
+        # by trimming older lines when exceeding a threshold (2000 lines).
+        try:
+            # Count lines by indexing 'end-1c' which returns '<line>.<col>'
+            last_index = self.log_text.index('end-1c')
+            last_line = int(last_index.split('.')[0])
+            if last_line > 5000:
+                # Delete the earliest 1000 lines to reclaim UI resources.
+                self.log_text.delete('1.0', '1000.0')
+        except Exception:
+            pass
+
+        self.log_text.configure(state="disabled")
+
     def _on_log_entry(self, event: AppEvent) -> None:
-        self.after(500, self.refresh)
+        # Schedule incremental append on the Tk main thread. Avoid calling
+        # refresh() here because that reloads up to 2000 entries and blocks the UI.
+        entry = event.data
+        self.after(0, lambda: self._append_log_entry(entry))
