@@ -75,19 +75,21 @@ class AppLogger:
         self.logger.addHandler(self._db_handler)
 
     def debug(self, msg: str, module: str = "") -> None:
-        self.logger.debug(msg, extra={"module": module or "general"})
+        # Use a non-reserved extra key 'app_module' to avoid overwriting LogRecord
+        # attributes (Python 3.14 disallows overwriting certain fields like 'module').
+        self.logger.debug(msg, extra={"app_module": module or "general"})
 
     def info(self, msg: str, module: str = "") -> None:
-        self.logger.info(msg, extra={"module": module or "general"})
+        self.logger.info(msg, extra={"app_module": module or "general"})
 
     def success(self, msg: str, module: str = "") -> None:
-        self.logger.log(25, msg, extra={"module": module or "general"})
+        self.logger.log(25, msg, extra={"app_module": module or "general"})
 
     def warning(self, msg: str, module: str = "") -> None:
-        self.logger.warning(msg, extra={"module": module or "general"})
+        self.logger.warning(msg, extra={"app_module": module or "general"})
 
     def error(self, msg: str, module: str = "") -> None:
-        self.logger.error(msg, extra={"module": module or "general"})
+        self.logger.error(msg, extra={"app_module": module or "general"})
 
     def set_level(self, level: str) -> None:
         level_map = {
@@ -113,10 +115,14 @@ class DatabaseLogHandler(logging.Handler):
             if self._db is None:
                 self._db = Database()
 
+            # Prefer the app-provided module name (app_module) falling back to
+            # the standard LogRecord.module if present.
+            module_name = getattr(record, "app_module", getattr(record, "module", "general"))
+
             entry = LogEntry(
                 timestamp=datetime.now().isoformat(),
                 level=record.levelname,
-                module=getattr(record, "module", "general"),
+                module=module_name,
                 message=self.format(record)
             )
             self._db.insert_log(entry)
