@@ -52,7 +52,13 @@ class ProxyValidator:
             pool = self._endpoint_manager.get_pool(protocol)
             endpoint = pool.get_endpoint()
 
-        proxy_url = f"{protocol}://{proxy.host}:{proxy.port}"
+        # For HTTP/HTTPS validation use an explicit http:// proxy URL so
+        # requests uses CONNECT tunneling for TLS targets rather than
+        # attempting TLS to the proxy itself. See audit C-03.
+        if protocol in ("http", "https"):
+            proxy_url = f"http://{proxy.host}:{proxy.port}"
+        else:
+            proxy_url = f"{protocol}://{proxy.host}:{proxy.port}"
 
         try:
             if protocol in ("http", "https"):
@@ -100,7 +106,8 @@ class ProxyValidator:
         start = time.time()
         try:
             session = self._get_session(protocol)
-            proxies = {protocol: proxy_url}
+            # Point both http and https at the same CONNECT-style proxy
+            proxies = {"http": proxy_url, "https": proxy_url}
             resp = session.get(
                 endpoint,
                 proxies=proxies,
